@@ -23,12 +23,15 @@ from __future__ import (absolute_import, division, print_function,
 
 import collections
 import json
+import logging
 
 from backtrader import BrokerBase, OrderBase, Order
 from backtrader.position import Position
 from backtrader.utils.py3 import queue, with_metaclass
 
 from .ccxtstore import CCXTStore
+
+_log = logging.getLogger(__name__)
 
 
 class CCXTOrder(OrderBase):

@@ -22,6 +22,7 @@ from __future__ import (absolute_import, division, print_function,
                         unicode_literals)
 
 import time
+import logging
 from datetime import datetime
 from functools import wraps
 
@@ -30,6 +31,8 @@ import ccxt
 from backtrader.metabase import MetaParams
 from backtrader.utils.py3 import with_metaclass
 from ccxt.base.errors import NetworkError, ExchangeError
+
+_log = logging.getLogger(__name__)
 
 
 class MetaSingleton(MetaParams):
@@ -95,13 +98,12 @@ class CCXTStore(with_metaclass(MetaSingleton, object)):
         '''Returns broker with *args, **kwargs from registered ``BrokerCls``'''
         return cls.BrokerCls(*args, **kwargs)
 
-    def __init__(self, exchange, currency, config, retries, debug=False, sandbox=False):
+    def __init__(self, exchange, currency, config, retries, sandbox=False):
         self.exchange = getattr(ccxt, exchange)(config)
         if sandbox:
             self.exchange.set_sandbox_mode(True)
         self.currency = currency
         self.retries = retries
-        self.debug = debug
         balance = self.exchange.fetch_balance() if 'secret' in config else 0
 
         if balance == 0 or not balance['free'][currency]:
@@ -119,6 +121,8 @@ class CCXTStore(with_metaclass(MetaSingleton, object)):
             raise NotImplementedError("'%s' exchange doesn't support fetching OHLCV data" % \
                                       self.exchange.name)
 
+
+
         granularity = self._GRANULARITIES.get((timeframe, compression))
         if granularity is None:
             raise ValueError("backtrader CCXT module doesn't support fetching OHLCV "
@@ -135,8 +139,7 @@ class CCXTStore(with_metaclass(MetaSingleton, object)):
         @wraps(method)
         def retry_method(self, *args, **kwargs):
             for i in range(self.retries):
-                if self.debug:
-                    print('{} - {} - Attempt {}'.format(datetime.now(), method.__name__, i))
+                _log.debug('%s - %s - Attempt %d', datetime.now(), method.__name__, i)
                 time.sleep(self.exchange.rateLimit / 1000)
                 try:
                     return method(self, *args, **kwargs)
@@ -182,8 +185,8 @@ class CCXTStore(with_metaclass(MetaSingleton, object)):
 
     @retry
     def fetch_ohlcv(self, symbol, timeframe, since, limit, params={}):
-        if self.debug:
-            print('Fetching: {}, TF: {}, Since: {}, Limit: {}'.format(symbol, timeframe, since, limit))
+        _log.debug('fetching up to %d %s %s candles from %s starting from %s', 
+                   limit, symbol, timeframe, self.exchange.name, since)
         return self.exchange.fetch_ohlcv(symbol, timeframe=timeframe, since=since, limit=limit, params=params)
 
     @retry

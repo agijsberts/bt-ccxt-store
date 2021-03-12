@@ -23,6 +23,8 @@ from __future__ import (absolute_import, division, print_function,
                         unicode_literals)
 
 import time
+import logging
+
 from collections import deque
 from datetime import datetime
 
@@ -32,6 +34,18 @@ from backtrader.utils.py3 import with_metaclass
 
 from .ccxtstore import CCXTStore
 
+_log = logging.getLogger(__name__)
+
+# NOTE:
+# the partial candle implementation is crap. It'd be better if we do something
+# like "subcandles", which would be assigning a value t_sub to each (partial) 
+# candle. t_sub would be incremented at predefined intervals (e.g., 10s, 20s, 
+# 30s, and so on). The current timestamp would then simple be (t, t_sub). A full
+# candle would be (t, inf) or (t, granularity).
+# This would allow us to easily check if we want to fetch a new candle. The 
+# downside is that we need the local computer time to be accurate to determine
+# the age of the candle, since the server time is not propagated by ccxt (some
+# exchanges may not return it; bybit does)
 
 class MetaCCXTFeed(DataBase.__class__):
     def __init__(cls, name, bases, dct):
@@ -42,7 +56,8 @@ class MetaCCXTFeed(DataBase.__class__):
         # Register with the store
         CCXTStore.DataCls = cls
 
-
+from autologging import traced
+@traced
 class CCXTFeed(with_metaclass(MetaCCXTFeed, DataBase)):
     """
     CryptoCurrency eXchange Trading Library Data Feed.
@@ -56,7 +71,7 @@ class CCXTFeed(with_metaclass(MetaCCXTFeed, DataBase)):
         Perform backfilling at the start. The maximum possible historical data
         will be fetched in a single request.
 
-    Changes From Ed's pacakge
+    Changes From Ed's package
 
         - Added option to send some additional fetch_ohlcv_params. Some exchanges (e.g Bitmex)
           support sending some additional fetch parameters.
@@ -66,12 +81,13 @@ class CCXTFeed(with_metaclass(MetaCCXTFeed, DataBase)):
     """
 
     params = (
-        ('historical', False),  # only historical download
-        ('backfill_start', False),  # do backfilling at the start
+#        ('historical', False),  # only historical download
+#        ('backfill_start', False),  # do backfilling at the start
         ('fetch_ohlcv_params', {}),
-        ('ohlcv_limit', 20),
-        ('drop_newest', False),
-        ('debug', False)
+        ('partial_candles', False),
+        ('limit', 200),
+#        ('minimum_candle_age', 0), # discard running candles younger than this many seconds 
+#        ('drop_newest', False)
     )
 
     _store = CCXTStore
@@ -81,122 +97,105 @@ class CCXTFeed(with_metaclass(MetaCCXTFeed, DataBase)):
 
     # def __init__(self, exchange, symbol, ohlcv_limit=None, config={}, retries=5):
     def __init__(self, **kwargs):
-        # self.store = CCXTStore(exchange, config, retries)
         self.store = self._store(**kwargs)
         self._data = deque()  # data queue for price data
         self._last_id = ''  # last processed trade id for ohlcv
-        self._last_ts = 0  # last processed timestamp for ohlcv
+        self._last_ts = 0  # last processed timestamp for ohlcv (in seconds)
 
-    def start(self, ):
+    def start(self):
         DataBase.start(self)
+
+        self.granularity = self.store.get_granularity(self._timeframe, self._compression)
+
+        if self.p.todate is not None and self.p.fromdate is None:
+            raise ValueError('requested to-date without from-date')
 
         if self.p.fromdate:
             self._state = self._ST_HISTORBACK
+            self._last_ts = int((self.p.fromdate - datetime(1970, 1, 1)).total_seconds())
             self.put_notification(self.DELAYED)
-            self._fetch_ohlcv(self.p.fromdate)
 
         else:
+            if self.p.partial_candles:
+                raise NotImplementedError('partial candles are not yet supported')
+
+            if self.p.limit < 3:
+                raise ValueError('limit should be set at least to 3 to work well')
+
             self._state = self._ST_LIVE
             self.put_notification(self.LIVE)
+
 
     def _load(self):
         if self._state == self._ST_OVER:
             return False
 
-        while True:
-            if self._state == self._ST_LIVE:
-                if self._timeframe == bt.TimeFrame.Ticks:
-                    return self._load_ticks()
-                else:
-                    self._fetch_ohlcv()
-                    ret = self._load_ohlcv()
-                    if self.p.debug:
-                        print('----     LOAD    ----')
-                        print('{} Load OHLCV Returning: {}'.format(datetime.utcnow(), ret))
-                    return ret
+        # historical data at ticks granularity is not supported 
+        if self._timeframe == bt.TimeFrame.Ticks:
+            return self._load_ticks()
 
-            elif self._state == self._ST_HISTORBACK:
-                ret = self._load_ohlcv()
-                if ret:
-                    return ret
-                else:
-                    # End of historical data
-                    if self.p.historical:  # only historical
-                        self.put_notification(self.DISCONNECTED)
-                        self._state = self._ST_OVER
-                        return False  # end of historical
-                    else:
-                        self._state = self._ST_LIVE
-                        self.put_notification(self.LIVE)
-                        continue
+        if len(self._data) == 0:
+            self._fetch_ohlcv()
 
-    def _fetch_ohlcv(self, fromdate=None):
-        """Fetch OHLCV data into self._data queue"""
-        granularity = self.store.get_granularity(self._timeframe, self._compression)
+        ohlcv = self._load_ohlcv()
+        _log.debug('loaded ohlcv %s', ohlcv)
 
-        if fromdate:
-            since = int((fromdate - datetime(1970, 1, 1)).total_seconds() * 1000)
+        # we got a candle
+        if ohlcv:
+            # quit if we went beyond a to-date
+            if self.p.todate is not None and self.lines.datetime[0] >= bt.date2num(self.p.todate):
+                _log.info('arrived at upper date limit for data loading %s', self.lines.datetime[0])
+
+                self.put_notification(self.DISCONNECTED)
+                self._state = self._ST_OVER
+                return False  # end of historical
+
+            # if not, go ahead and return it
+            return ohlcv
+
         else:
+            # no new data, so if we were backfilling it means we switch to live
+            if self._state == self._ST_HISTORBACK:
+                _log.info('switching from historical to live data')
+
+                self._state = self._ST_LIVE
+                self.put_notification(self.LIVE)
+                                                                                                    
+
+    def _fetch_ohlcv(self):
+        fetch = True
+
+        # check minimum_candle_age
+#        if time.time() < self._last_ts + self.p.minimum_candle_age:
+#            fetch = False
+
+        if fetch:
+            _log.debug('fetching symbol %s at granularity %s starting from %s (%s)', 
+                      self.p.dataname, self.granularity, self._last_ts, datetime.utcfromtimestamp(self._last_ts))
+
+            since = None
             if self._last_ts > 0:
-                since = self._last_ts
-            else:
-                since = None
+                since = self._last_ts * 1000
 
-        limit = self.p.ohlcv_limit
+            batch = self.store.fetch_ohlcv(self.p.dataname, timeframe=self.granularity,
+                                           since=since, limit=self.p.limit)
 
-        while True:
-            dlen = len(self._data)
+            batch = sorted(batch)
 
-            if self.p.debug:
-                # TESTING
-                since_dt = datetime.utcfromtimestamp(since // 1000) if since is not None else 'NA'
-                print('---- NEW REQUEST ----')
-                print('{} - Requesting: Since TS {} Since date {} granularity {}, limit {}, params'.format(
-                    datetime.utcnow(), since, since_dt, granularity, limit, self.p.fetch_ohlcv_params))
-                data = sorted(self.store.fetch_ohlcv(self.p.dataname, timeframe=granularity,
-                                                     since=since, limit=limit, params=self.p.fetch_ohlcv_params))
-                try:
-                    for i, ohlcv in enumerate(data):
-                        tstamp, open_, high, low, close, volume = ohlcv
-                        print('{} - Data {}: {} - TS {} Time {}'.format(datetime.utcnow(), i,
-                                                                        datetime.utcfromtimestamp(tstamp // 1000),
-                                                                        tstamp, (time.time() * 1000)))
-                        # ------------------------------------------------------------------
-                except IndexError:
-                    print('Index Error: Data = {}'.format(data))
-                print('---- REQUEST END ----')
-            else:
+            if self._state == self._ST_LIVE and not self.p.partial_candles:
+                _log.debug('dropping most recent partial candle')
+                batch = batch[:-1]
 
-                data = sorted(self.store.fetch_ohlcv(self.p.dataname, timeframe=granularity,
-                                                     since=since, limit=limit, params=self.p.fetch_ohlcv_params))
-
-            # Check to see if dropping the latest candle will help with
-            # exchanges which return partial data
-            if self.p.drop_newest:
-                del data[-1]
-
-            for ohlcv in data:
-
-                # for ohlcv in sorted(self.store.fetch_ohlcv(self.p.dataname, timeframe=granularity,
-                #                                           since=since, limit=limit, params=self.p.fetch_ohlcv_params)):
-
+            for ohlcv in batch:
                 if None in ohlcv:
                     continue
 
-                tstamp = ohlcv[0]
-
-                # Prevent from loading incomplete data
-                # if tstamp > (time.time() * 1000):
-                #    continue
-
+                tstamp = ohlcv[0] // 1000
                 if tstamp > self._last_ts:
-                    if self.p.debug:
-                        print('Adding: {}'.format(ohlcv))
+                    _log.debug('add ohlcv %s (%s) to deque', ohlcv, datetime.utcfromtimestamp(tstamp))
                     self._data.append(ohlcv)
                     self._last_ts = tstamp
 
-            if dlen == len(self._data):
-                break
 
     def _load_ticks(self):
         if self._last_id is None:
@@ -246,10 +245,16 @@ class CCXTFeed(with_metaclass(MetaCCXTFeed, DataBase)):
         self.lines.close[0] = close
         self.lines.volume[0] = volume
 
+        _log.info('loading candle from %s - open: %s, high: %s, low: %s, close: %s, volume: %s', 
+                   dtime, open_, high, low, close, volume)
+
         return True
 
     def haslivedata(self):
-        return self._state == self._ST_LIVE and self._data
+        return self._state == self._ST_LIVE and len(self._data) > 0
 
     def islive(self):
-        return not self.p.historical
+        '''Returns ``True`` to notify ``Cerebro`` that preloading and runonce
+        should be deactivated'''
+        return self.p.todate is None
+
