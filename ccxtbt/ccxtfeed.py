@@ -112,7 +112,10 @@ class CCXTFeed(with_metaclass(MetaCCXTFeed, DataBase)):
 
         if self.p.fromdate:
             self._state = self._ST_HISTORBACK
-            self._last_ts = int((self.p.fromdate - datetime(1970, 1, 1)).total_seconds())
+            # NOTE: substracting one second is an ugly workaround to ensure
+            # that the fromdate is included. we can probably avoid this workaround
+            # with the (t, t_sub) tuples described above.
+            self._last_ts = int((self.p.fromdate - datetime(1970, 1, 1)).total_seconds()) - 1
             self.put_notification(self.DELAYED)
 
         else:
@@ -144,7 +147,7 @@ class CCXTFeed(with_metaclass(MetaCCXTFeed, DataBase)):
         if ohlcv:
             # quit if we went beyond a to-date
             if self.p.todate is not None and self.lines.datetime[0] >= bt.date2num(self.p.todate):
-                _log.info('arrived at upper date limit for data loading %s', self.lines.datetime[0])
+                _log.info('arrived at the end date %s of the feed', bt.num2date(self.lines.datetime[0]))
 
                 self.put_notification(self.DISCONNECTED)
                 self._state = self._ST_OVER
@@ -154,8 +157,17 @@ class CCXTFeed(with_metaclass(MetaCCXTFeed, DataBase)):
             return ohlcv
 
         else:
+            # quit if we had a to-date
+            if self.p.todate is not None:
+                _log.info('arrived at the end of the feed')
+
+                self.put_notification(self.DISCONNECTED)
+                self._state = self._ST_OVER
+                return False  # end of historical
+
+
             # no new data, so if we were backfilling it means we switch to live
-            if self._state == self._ST_HISTORBACK:
+            else:
                 _log.info('switching from historical to live data')
 
                 self._state = self._ST_LIVE
