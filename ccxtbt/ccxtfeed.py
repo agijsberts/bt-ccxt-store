@@ -56,8 +56,7 @@ class MetaCCXTFeed(DataBase.__class__):
         # Register with the store
         CCXTStore.DataCls = cls
 
-from autologging import traced
-@traced
+
 class CCXTFeed(with_metaclass(MetaCCXTFeed, DataBase)):
     """
     CryptoCurrency eXchange Trading Library Data Feed.
